@@ -275,4 +275,190 @@ describe("mf-alert-bot worker", () => {
 			],
 		});
 	});
+
+	it("fetches distinct active schemes and bulk-updates last_nav and is_triggered across multiple rows", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+
+		await env.DB.batch([
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(1001, 111001, "Fund A", 100, 10, 110, 100, 0),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(1002, 111001, "Fund A", 100, 20, 120, 100, 0),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(1003, 111001, "Fund A", 100, 5, 105, 106, 1), // Already triggered
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(1004, 111002, "Fund B", 50, 10, 55, 50, 0),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(1005, 111003, "Fund C (Already Triggered Only)", 200, 10, 220, 221, 1),
+		]);
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/111001/latest")) {
+				return new Response(JSON.stringify({ data: [{ nav: "115.00" }] }), { status: 200 });
+			}
+			if (url.includes("api.mfapi.in/mf/111002/latest")) {
+				return new Response(JSON.stringify({ data: [{ nav: "52.50" }] }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const batchSpy = vi.spyOn(env.DB, "batch");
+
+		const ctx = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx);
+		await waitOnExecutionContext(ctx);
+
+		// Should only fetch 111001 and 111002 once each (111003 has no active rows)
+		const navCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("api.mfapi.in/mf/"));
+		expect(navCalls).toHaveLength(2);
+		expect(navCalls.map(([url]) => String(url)).sort()).toEqual([
+			"https://api.mfapi.in/mf/111001/latest",
+			"https://api.mfapi.in/mf/111002/latest",
+		]);
+
+		// Only chat 1001 achieved its target
+		const messageCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("sendMessage"));
+		expect(messageCalls).toHaveLength(1);
+		expect(JSON.parse(String(messageCalls[0][1]?.body)).chat_id).toBe(1001);
+
+		// Bulk batch calls: 1 to select triggered rows + 1 to bulk update last_nav & is_triggered
+		expect(batchSpy).toHaveBeenCalledTimes(2);
+
+		const { results: rows } = await env.DB.prepare(
+			"SELECT chat_id, last_nav, is_triggered FROM tracked_funds ORDER BY chat_id"
+		).all<{ chat_id: number; last_nav: number; is_triggered: number }>();
+
+		expect(rows).toEqual([
+			{ chat_id: 1001, last_nav: 115, is_triggered: 1 },
+			{ chat_id: 1002, last_nav: 115, is_triggered: 0 },
+			{ chat_id: 1003, last_nav: 106, is_triggered: 1 },
+			{ chat_id: 1004, last_nav: 52.5, is_triggered: 0 },
+			{ chat_id: 1005, last_nav: 221, is_triggered: 1 },
+		]);
+	});
+
+	it("only marks is_triggered = 1 for rows whose Telegram notification succeeded", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+
+		await env.DB.batch([
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			).bind(2001, 222001, "Fund Retry", 100, 5, 105, 100),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			).bind(2002, 222001, "Fund Retry", 100, 5, 105, 100),
+		]);
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/222001/latest")) {
+				return new Response(JSON.stringify({ data: [{ nav: "110.00" }] }), { status: 200 });
+			}
+			if (url.includes("sendMessage")) {
+				const body = JSON.parse(String(init?.body));
+				if (body.chat_id === 2001) {
+					return new Response("Forbidden", { status: 403 });
+				}
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const ctx = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const { results: rows } = await env.DB.prepare(
+			"SELECT chat_id, last_nav, is_triggered FROM tracked_funds ORDER BY chat_id"
+		).all<{ chat_id: number; last_nav: number; is_triggered: number }>();
+
+		expect(rows).toEqual([
+			{ chat_id: 2001, last_nav: 110, is_triggered: 0 },
+			{ chat_id: 2002, last_nav: 110, is_triggered: 1 },
+		]);
+	});
+
+	it("chunks bulk is_triggered updates across more than 100 notified rows", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+
+		const totalRows = 105;
+		const insertStmt = env.DB.prepare(
+			`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		);
+		await env.DB.batch(
+			Array.from({ length: totalRows }, (_, i) => insertStmt.bind(3000 + i, 333001, "Bulk Fund", 100, 10, 110, 100))
+		);
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/333001/latest")) {
+				return new Response(JSON.stringify({ data: [{ nav: "115.00" }] }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const batchSpy = vi.spyOn(env.DB, "batch");
+
+		const ctx = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(batchSpy).toHaveBeenCalledTimes(2);
+		// Second batch: 1 statement for last_nav + 2 chunked statements for 105 notified IDs (100 + 5)
+		expect(batchSpy.mock.calls[1][0]).toHaveLength(3);
+
+		const summary = await env.DB.prepare(
+			"SELECT COUNT(*) as total, SUM(is_triggered) as triggered_count, MIN(last_nav) as min_nav, MAX(last_nav) as max_nav FROM tracked_funds"
+		).first<{ total: number; triggered_count: number; min_nav: number; max_nav: number }>();
+
+		expect(summary).toEqual({
+			total: 105,
+			triggered_count: 105,
+			min_nav: 115,
+			max_nav: 115,
+		});
+	});
+
+	it("returns early when there are no active tracked_funds or all NAV fetches fail", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const batchSpy = vi.spyOn(env.DB, "batch");
+
+		const ctx1 = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx1);
+		await waitOnExecutionContext(ctx1);
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(batchSpy).not.toHaveBeenCalled();
+
+		await env.DB.prepare(
+			`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		)
+			.bind(4001, 444001, "Broken Fund", 100, 10, 110, 100)
+			.run();
+
+		fetchSpy.mockRejectedValue(new Error("Network error"));
+
+		const ctx2 = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx2);
+		await waitOnExecutionContext(ctx2);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(batchSpy).not.toHaveBeenCalled();
+	});
 });

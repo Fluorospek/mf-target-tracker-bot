@@ -3,6 +3,16 @@ export interface Env {
 	BOT_TOKEN: string;
 }
 
+interface TrackedFundRow {
+	id: number;
+	chat_id: number;
+	scheme_code: number;
+	scheme_name: string;
+	baseline_nav: number;
+	target_pct: number;
+	target_nav: number;
+}
+
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -321,25 +331,23 @@ export default {
 	// 2. Cron Trigger Handler: Evaluates Daily at 7:00 AM IST
 	// -----------------------------------------------------------
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-		const { results }: any = await env.DB.prepare(
-			"SELECT * FROM tracked_funds WHERE is_triggered = 0"
-		).all();
+		const { results: schemeRows } = await env.DB.prepare(
+			"SELECT DISTINCT scheme_code FROM tracked_funds WHERE is_triggered = 0"
+		).all<{ scheme_code: number }>();
 
-		if (!results || results.length === 0) return;
+		if (!schemeRows || schemeRows.length === 0) return;
 
-		// Deduplicate scheme codes to minimize external HTTP calls
-		const distinctCodes: number[] = Array.from(new Set(results.map((r: any) => r.scheme_code)));
-		const navCache: Record<number, number> = {};
+		const navCache = new Map<number, number>();
 
-		for (const code of distinctCodes) {
+		for (const { scheme_code: code } of schemeRows) {
 			try {
 				const res = await fetch(`https://api.mfapi.in/mf/${code}/latest`);
 				const json: any = await res.json();
 				const navStr = json?.data?.[0]?.nav;
 				if (navStr) {
 					const parsed = parseFloat(navStr);
-					if (!isNaN(parsed)) {
-						navCache[code] = parsed;
+					if (!isNaN(parsed) && parsed > 0) {
+						navCache.set(code, parsed);
 					}
 				}
 			} catch (e) {
@@ -347,36 +355,63 @@ export default {
 			}
 		}
 
-		for (const row of results) {
-			const currentNav = navCache[row.scheme_code];
-			if (!currentNav) continue;
+		if (navCache.size === 0) return;
 
-			const baselineNav = Number(row.baseline_nav);
-			const targetNav = Number(row.target_nav);
-			const gainPct = ((currentNav - baselineNav) / baselineNav) * 100;
+		const navEntries = Array.from(navCache.entries());
 
-			try {
-				if (currentNav >= targetNav) {
-					// Target achieved: Send alert and mark as triggered
+		// Query only active tracked_funds whose targets have been achieved
+		const selectTriggeredStmt = env.DB.prepare(
+			`SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav
+       FROM tracked_funds
+       WHERE is_triggered = 0 AND scheme_code = ? AND target_nav <= ?`
+		);
+		const triggeredResults = await env.DB.batch<TrackedFundRow>(
+			navEntries.map(([code, nav]) => selectTriggeredStmt.bind(code, nav))
+		);
+
+		const notifiedIds: number[] = [];
+
+		for (const result of triggeredResults) {
+			for (const row of result.results ?? []) {
+				const currentNav = navCache.get(row.scheme_code);
+				if (!currentNav) continue;
+
+				const baselineNav = Number(row.baseline_nav);
+				const targetNav = Number(row.target_nav);
+				const gainPct = ((currentNav - baselineNav) / baselineNav) * 100;
+
+				try {
 					await sendMessage(
 						env.BOT_TOKEN,
 						row.chat_id,
-						`🎯 <b>Target Achieved!</b>\n\n<b>Fund:</b> ${escapeHtml(String(row.scheme_name))}\n<b>Baseline NAV:</b> ₹${baselineNav.toFixed(2)}\n<b>Current NAV:</b> ₹${currentNav.toFixed(2)} (+${gainPct.toFixed(2)}%)\n<b>Target Set:</b> +${row.target_pct}% (₹${targetNav.toFixed(2)})\n\nYou may log in to review or rebalance your holding.`,
+						`🎯 <b>Target Achieved!</b>\n\n<b>Fund:</b> ${escapeHtml(String(row.scheme_name))}\n<b>Baseline NAV:</b> ₹${baselineNav.toFixed(2)}\n<b>Current NAV:</b> ₹${currentNav.toFixed(2)} (+${gainPct.toFixed(2)}%)\n<b>Target Set:</b> +${row.target_pct}% (₹${targetNav.toFixed(2)})\n\n`,
 						{ parse_mode: "HTML" }
 					);
-
-					await env.DB.prepare("UPDATE tracked_funds SET is_triggered = 1, last_nav = ? WHERE id = ?")
-						.bind(currentNav, row.id)
-						.run();
-				} else {
-					// Update last NAV quietly
-					await env.DB.prepare("UPDATE tracked_funds SET last_nav = ? WHERE id = ?")
-						.bind(currentNav, row.id)
-						.run();
+					notifiedIds.push(row.id);
+				} catch (e) {
+					console.error(`Failed to process tracked_fund ${row.id}:`, e);
 				}
-			} catch (e) {
-				console.error(`Failed to process tracked_fund ${row.id}:`, e);
 			}
 		}
+
+		// Bulk-update last_nav per scheme and mark notified rows as triggered in one batch transaction
+		const updateNavStmt = env.DB.prepare(
+			"UPDATE tracked_funds SET last_nav = ? WHERE scheme_code = ? AND is_triggered = 0"
+		);
+		const updateStatements: D1PreparedStatement[] = navEntries.map(([code, nav]) =>
+			updateNavStmt.bind(nav, code)
+		);
+
+		// D1 allows at most 100 bound parameters per SQL statement
+		const MAX_D1_PARAMS = 100;
+		for (let i = 0; i < notifiedIds.length; i += MAX_D1_PARAMS) {
+			const chunk = notifiedIds.slice(i, i + MAX_D1_PARAMS);
+			const placeholders = chunk.map(() => "?").join(", ");
+			updateStatements.push(
+				env.DB.prepare(`UPDATE tracked_funds SET is_triggered = 1 WHERE id IN (${placeholders})`).bind(...chunk)
+			);
+		}
+
+		await env.DB.batch(updateStatements);
 	},
 };
