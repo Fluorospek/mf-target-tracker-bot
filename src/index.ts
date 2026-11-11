@@ -13,8 +13,27 @@ interface TrackedFundRow {
 	target_nav: number;
 }
 
+interface InlineKeyboardButton {
+	text: string;
+	callback_data: string;
+}
+
+interface DeletePagePayload {
+	text: string;
+	replyMarkup: { inline_keyboard: InlineKeyboardButton[][] };
+}
+
+const DELETE_PAGE_SIZE = 5;
+
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Formats a tracked fund row's scheme name, baseline NAV, and target details as Telegram HTML. */
+function formatTargetSummary(
+	row: Pick<TrackedFundRow, "scheme_name" | "baseline_nav" | "target_pct" | "target_nav">
+): string {
+	return `<b>${escapeHtml(String(row.scheme_name))}</b>\n  Base NAV: ₹${Number(row.baseline_nav).toFixed(2)} | Target: +${row.target_pct}% (₹${Number(row.target_nav).toFixed(2)})`;
 }
 
 // -------------------------------------------------------------
@@ -52,6 +71,104 @@ async function sendMessage(
 	});
 }
 
+/** Edits an existing Telegram message when messageId is available, or sends a new message otherwise. */
+async function sendOrEditMessage(
+	token: string,
+	chatId: number,
+	messageId: number | undefined,
+	text: string,
+	extra: Record<string, unknown> = {},
+	clearInlineKeyboard = false
+): Promise<void> {
+	if (messageId == null) {
+		await sendMessage(token, chatId, text, extra);
+		return;
+	}
+
+	const payload: Record<string, unknown> = {
+		chat_id: chatId,
+		message_id: messageId,
+		text,
+		...extra,
+	};
+	if (clearInlineKeyboard && !("reply_markup" in payload)) {
+		payload.reply_markup = { inline_keyboard: [] };
+	}
+
+	try {
+		await sendTelegram(token, "editMessageText", payload);
+	} catch (err: any) {
+		// Ignore Telegram's benign error when an edit leaves message content and markup unchanged
+		if (err instanceof Error && err.message.includes("message is not modified")) {
+			return;
+		}
+		throw err;
+	}
+}
+
+/** Builds a paginated 5-item selection message and inline keyboard for active targets in a chat. */
+async function buildDeletePagePayload(
+	db: D1Database,
+	chatId: number,
+	requestedPage: number
+): Promise<DeletePagePayload | null> {
+	const countRow = await db
+		.prepare("SELECT COUNT(*) AS total FROM tracked_funds WHERE chat_id = ? AND is_triggered = 0 AND is_deleted = 0")
+		.bind(chatId)
+		.first<{ total: number }>();
+
+	const total = Number(countRow?.total ?? 0);
+	if (total === 0) {
+		return null;
+	}
+
+	const totalPages = Math.ceil(total / DELETE_PAGE_SIZE);
+	const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+	const offset = page * DELETE_PAGE_SIZE;
+
+	const { results: items } = await db
+		.prepare(
+			`SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav
+       FROM tracked_funds
+       WHERE chat_id = ? AND is_triggered = 0 AND is_deleted = 0
+       ORDER BY id ASC
+       LIMIT ? OFFSET ?`
+		)
+		.bind(chatId, DELETE_PAGE_SIZE, offset)
+		.all<TrackedFundRow>();
+
+	if (!items || items.length === 0) {
+		return null;
+	}
+
+	const listText = items.map((item, idx) => `<b>${idx + 1}.</b> ${formatTargetSummary(item)}`).join("\n\n");
+
+	const inlineKeyboard: InlineKeyboardButton[][] = [
+		items.map((item, idx) => ({
+			text: String(idx + 1),
+			callback_data: `DELETE_FUND:${item.id}`,
+		})),
+	];
+
+	if (totalPages > 1) {
+		const navRow: InlineKeyboardButton[] = [];
+		if (page > 0) {
+			navRow.push({ text: "⬅️ Prev", callback_data: `DELETE_PAGE:${page - 1}` });
+		}
+		if (page < totalPages - 1) {
+			navRow.push({ text: "Next ➡️", callback_data: `DELETE_PAGE:${page + 1}` });
+		}
+		if (navRow.length > 0) {
+			inlineKeyboard.push(navRow);
+		}
+	}
+
+	return {
+		text: `🗑️ <b>Select a target to delete</b> (Page ${page + 1} of ${totalPages}):\n\n${listText}`,
+		replyMarkup: { inline_keyboard: inlineKeyboard },
+	};
+}
+
 export default {
 	// -----------------------------------------------------------
 	// 1. Webhook Handler: Bot Conversations & Registration
@@ -64,10 +181,11 @@ export default {
 		try {
 			const update: any = await request.json();
 
-			// Handle button clicks (Callback Queries for fund selection)
+			// Handle button clicks (Callback Queries for fund selection & deletion)
 			if (update.callback_query) {
 				const query = update.callback_query;
 				const chatId = query.message?.chat?.id;
+				const messageId: number | undefined = query.message?.message_id;
 				const data: string | undefined = query.data;
 
 				if (query.id) {
@@ -80,9 +198,10 @@ export default {
 					return new Response("OK");
 				}
 
-				const [action, schemeCode] = data.split(":");
+				const [action, arg] = data.split(":");
 
-				if (action === "SELECT_FUND" && schemeCode) {
+				if (action === "SELECT_FUND" && arg) {
+					const schemeCode = arg;
 					const res = await fetch(`https://api.mfapi.in/mf/${encodeURIComponent(schemeCode)}/latest`);
 					const fundData: any = await res.json();
 					const latestEntry = fundData?.data?.[0];
@@ -114,7 +233,72 @@ export default {
 						`Selected: <b>${escapeHtml(schemeName)}</b>\nLatest NAV: ₹${latestNav.toFixed(2)}\n\nEnter your purchase NAV (or reply <b>current</b> to track from today):`,
 						{ parse_mode: "HTML" }
 					);
+					return new Response("OK");
 				}
+
+				if (action === "DELETE_PAGE" && arg && /^\d+$/.test(arg)) {
+					const page = Number(arg);
+					const payload = await buildDeletePagePayload(env.DB, chatId, page);
+					if (!payload) {
+						await sendOrEditMessage(
+							env.BOT_TOKEN,
+							chatId,
+							messageId,
+							"No active targets to delete. Use /add to start tracking.",
+							{},
+							true
+						);
+						return new Response("OK");
+					}
+
+					await sendOrEditMessage(env.BOT_TOKEN, chatId, messageId, payload.text, {
+						parse_mode: "HTML",
+						reply_markup: payload.replyMarkup,
+					});
+					return new Response("OK");
+				}
+
+				if (action === "DELETE_FUND" && arg && /^\d+$/.test(arg)) {
+					const fundId = Number(arg);
+					const target = await env.DB.prepare(
+						`SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav
+             FROM tracked_funds
+             WHERE id = ? AND chat_id = ? AND is_triggered = 0 AND is_deleted = 0`
+					)
+						.bind(fundId, chatId)
+						.first<TrackedFundRow>();
+
+					const deleteResult = target
+						? await env.DB.prepare(
+								"UPDATE tracked_funds SET is_deleted = 1 WHERE id = ? AND chat_id = ? AND is_triggered = 0 AND is_deleted = 0"
+						  )
+								.bind(fundId, chatId)
+								.run()
+						: null;
+
+					if (!target || !deleteResult?.meta.changes) {
+						await sendOrEditMessage(
+							env.BOT_TOKEN,
+							chatId,
+							messageId,
+							"That target is no longer active or was already deleted.",
+							{},
+							true
+						);
+						return new Response("OK");
+					}
+
+					await sendOrEditMessage(
+						env.BOT_TOKEN,
+						chatId,
+						messageId,
+						`🗑️ <b>Target Deleted!</b>\n\n• ${formatTargetSummary(target)}\n\nUse /delete to remove another target or /list to view active targets.`,
+						{ parse_mode: "HTML" },
+						true
+					);
+					return new Response("OK");
+				}
+
 				return new Response("OK");
 			}
 
@@ -135,7 +319,7 @@ export default {
 					await sendMessage(
 						env.BOT_TOKEN,
 						chatId,
-						"👋 Welcome to Mutual Fund Target Tracker!\n\nCommands:\n/add - Track a new fund\n/list - View your active targets\n/help - Instructions"
+						"👋 Welcome to Mutual Fund Target Tracker!\n\nCommands:\n/add - Track a new fund\n/list - View your active targets\n/delete - Delete an active target\n/help - Instructions"
 					);
 					return new Response("OK");
 				}
@@ -149,7 +333,7 @@ export default {
 						"2. Tap your fund from the search results.\n" +
 						"3. Enter your purchase NAV (or reply <code>current</code>).\n" +
 						"4. Enter your target gain % (e.g., <code>10</code> for +10%).\n\n" +
-						"Use /list anytime to view active targets. Funds are checked daily at 7:00 AM IST.",
+						"Use /list anytime to view active targets or /delete to remove one. Funds are checked daily at 7:00 AM IST.",
 						{ parse_mode: "HTML" }
 					);
 					return new Response("OK");
@@ -173,11 +357,11 @@ export default {
 				}
 
 				if (command === "/list") {
-					const { results }: any = await env.DB.prepare(
-						"SELECT * FROM tracked_funds WHERE chat_id = ? AND is_triggered = 0"
+					const { results } = await env.DB.prepare(
+						"SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav FROM tracked_funds WHERE chat_id = ? AND is_triggered = 0 AND is_deleted = 0 ORDER BY id ASC"
 					)
 						.bind(chatId)
-						.all();
+						.all<TrackedFundRow>();
 
 					if (!results || results.length === 0) {
 						await sendMessage(env.BOT_TOKEN, chatId, "No active targets set. Use /add to start tracking.");
@@ -186,10 +370,26 @@ export default {
 
 					let responseText = "📊 <b>Active Target Funds:</b>\n\n";
 					for (const item of results) {
-						responseText += `• <b>${escapeHtml(String(item.scheme_name))}</b>\n  Base NAV: ₹${Number(item.baseline_nav).toFixed(2)} | Target: +${item.target_pct}% (₹${Number(item.target_nav).toFixed(2)})\n\n`;
+						responseText += `• ${formatTargetSummary(item)}\n\n`;
 					}
 
 					await sendMessage(env.BOT_TOKEN, chatId, responseText, { parse_mode: "HTML" });
+					return new Response("OK");
+				}
+
+				if (command === "/delete") {
+					await env.DB.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ?").bind(chatId).run();
+
+					const payload = await buildDeletePagePayload(env.DB, chatId, 0);
+					if (!payload) {
+						await sendMessage(env.BOT_TOKEN, chatId, "No active targets to delete. Use /add to start tracking.");
+						return new Response("OK");
+					}
+
+					await sendMessage(env.BOT_TOKEN, chatId, payload.text, {
+						parse_mode: "HTML",
+						reply_markup: payload.replyMarkup,
+					});
 					return new Response("OK");
 				}
 
@@ -332,7 +532,7 @@ export default {
 	// -----------------------------------------------------------
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
 		const { results: schemeRows } = await env.DB.prepare(
-			"SELECT DISTINCT scheme_code FROM tracked_funds WHERE is_triggered = 0"
+			"SELECT DISTINCT scheme_code FROM tracked_funds WHERE is_triggered = 0 AND is_deleted = 0"
 		).all<{ scheme_code: number }>();
 
 		if (!schemeRows || schemeRows.length === 0) return;
@@ -363,7 +563,7 @@ export default {
 		const selectTriggeredStmt = env.DB.prepare(
 			`SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav
        FROM tracked_funds
-       WHERE is_triggered = 0 AND scheme_code = ? AND target_nav <= ?`
+       WHERE is_triggered = 0 AND is_deleted = 0 AND scheme_code = ? AND target_nav <= ?`
 		);
 		const triggeredResults = await env.DB.batch<TrackedFundRow>(
 			navEntries.map(([code, nav]) => selectTriggeredStmt.bind(code, nav))
@@ -396,7 +596,7 @@ export default {
 
 		// Bulk-update last_nav per scheme and mark notified rows as triggered in one batch transaction
 		const updateNavStmt = env.DB.prepare(
-			"UPDATE tracked_funds SET last_nav = ? WHERE scheme_code = ? AND is_triggered = 0"
+			"UPDATE tracked_funds SET last_nav = ? WHERE scheme_code = ? AND is_triggered = 0 AND is_deleted = 0"
 		);
 		const updateStatements: D1PreparedStatement[] = navEntries.map(([code, nav]) =>
 			updateNavStmt.bind(nav, code)
@@ -408,7 +608,9 @@ export default {
 			const chunk = notifiedIds.slice(i, i + MAX_D1_PARAMS);
 			const placeholders = chunk.map(() => "?").join(", ");
 			updateStatements.push(
-				env.DB.prepare(`UPDATE tracked_funds SET is_triggered = 1 WHERE id IN (${placeholders})`).bind(...chunk)
+				env.DB.prepare(`UPDATE tracked_funds SET is_triggered = 1 WHERE id IN (${placeholders}) AND is_deleted = 0`).bind(
+					...chunk
+				)
 			);
 		}
 

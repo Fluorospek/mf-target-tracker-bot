@@ -26,7 +26,8 @@ Commands support optional `@botname` suffixes (for example, `/start@your_bot_nam
 | :--- | :--- |
 | `/start` | Initializes or resets the user's conversation state to `IDLE` and shows available commands. |
 | `/add` | Starts the guided flow to search for a mutual fund and configure a new target alert. |
-| `/list` | Lists all active (untriggered) target funds for the current chat with baseline NAV, target %, and target NAV. |
+| `/list` | Lists all active (untriggered and non-deleted) target funds for the current chat with baseline NAV, target %, and target NAV. |
+| `/delete` | Shows a paginated list (5 per page) of active targets and soft-deletes (`is_deleted = 1`) the selected target. |
 | `/help` | Displays step-by-step usage instructions. |
 
 ### Conversational Setup Flow (`/add`)
@@ -45,7 +46,7 @@ The bot persists per-user wizard progress in the D1 `users` table:
 - **HTTP Webhook Handler (`fetch`)**: Processes Telegram `POST` webhook updates (`message.text` and `callback_query`) and responds `200 OK` to non-`POST` health checks.
 - **Cron Handler (`scheduled`)**: Evaluates active targets daily at `30 1 * * *` (`01:30 UTC` / `7:00 AM IST`).
 - **External APIs**:
-  - [Telegram Bot API](https://core.telegram.org/bots/api) (`sendMessage`, `answerCallbackQuery` via `fetch`)
+  - [Telegram Bot API](https://core.telegram.org/bots/api) (`sendMessage`, `editMessageText`, `answerCallbackQuery` via `fetch`)
   - [MFapi.in](https://www.mfapi.in/) (`/mf/search` and `/mf/{schemeCode}/latest`)
 - **Testing**: [Vitest](https://vitest.dev/) with [`@cloudflare/vitest-plugin`](https://developers.cloudflare.com/workers/testing/vitest-integration/)
 
@@ -54,7 +55,7 @@ The bot persists per-user wizard progress in the D1 `users` table:
 Defined in [`schema.sql`](./schema.sql):
 
 - **`users`**: Stores per-chat conversation state (`IDLE`, `AWAITING_QUERY`, `AWAITING_BASE_NAV`, `AWAITING_TARGET_PCT`) and temporary selections (`temp_scheme_code`, `temp_scheme_name`, `temp_base_nav`) during `/add`.
-- **`tracked_funds`**: Stores registered alerts (`chat_id`, `scheme_code`, `scheme_name`, `baseline_nav`, `target_pct`, `target_nav`, `last_nav`, `is_triggered`, `created_at`).
+- **`tracked_funds`**: Stores registered alerts (`chat_id`, `scheme_code`, `scheme_name`, `baseline_nav`, `target_pct`, `target_nav`, `last_nav`, `is_triggered`, `is_deleted`, `created_at`).
 
 ## Project Structure
 
@@ -96,6 +97,13 @@ pnpm exec wrangler d1 execute mf_tracker_db --local --file=./schema.sql
 
 # Remote D1 (for production)
 pnpm exec wrangler d1 execute mf_tracker_db --remote --file=./schema.sql
+```
+
+If upgrading an existing D1 database created before `is_deleted` was added:
+
+```bash
+pnpm exec wrangler d1 execute mf_tracker_db --local --command="ALTER TABLE tracked_funds ADD COLUMN is_deleted INTEGER DEFAULT 0;"
+pnpm exec wrangler d1 execute mf_tracker_db --remote --command="ALTER TABLE tracked_funds ADD COLUMN is_deleted INTEGER DEFAULT 0;"
 ```
 
 If you change bindings in `wrangler.jsonc`, regenerate [`worker-configuration.d.ts`](./worker-configuration.d.ts):

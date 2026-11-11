@@ -27,6 +27,7 @@ describe("mf-alert-bot worker", () => {
 				target_nav REAL NOT NULL,
 				last_nav REAL,
 				is_triggered INTEGER DEFAULT 0,
+				is_deleted INTEGER DEFAULT 0,
 				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 			)`
 		).run();
@@ -460,5 +461,258 @@ describe("mf-alert-bot worker", () => {
 
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		expect(batchSpy).not.toHaveBeenCalled();
+	});
+
+	it("handles /delete with no active targets (ignoring triggered and already deleted rows)", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+		const chatId = 61001;
+
+		await env.DB.batch([
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered, is_deleted)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(chatId, 500001, "Triggered Fund", 100, 10, 110, 112, 1, 0),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_triggered, is_deleted)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(chatId, 500002, "Deleted Fund", 100, 10, 110, 100, 0, 1),
+		]);
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ ok: true }), { status: 200 })
+		);
+
+		const res = await worker.fetch(
+			new IncomingRequest("https://example.com/", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ message: { chat: { id: chatId }, text: "/delete" } }),
+			}),
+			{ ...env, BOT_TOKEN: "test-token" }
+		);
+		expect(res.status).toBe(200);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const payload = JSON.parse(String(fetchSpy.mock.calls[0][1]?.body));
+		expect(payload.text).toContain("No active targets to delete");
+	});
+
+	it("paginates /delete in pages of 5, soft-deletes selected trigger, and excludes it from /list and cron", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+		const chatId = 62001;
+		const otherChatId = 62002;
+
+		// Put user mid-/add flow to verify /delete resets state to IDLE
+		await env.DB.prepare(
+			"INSERT INTO users (chat_id, state) VALUES (?, 'AWAITING_QUERY') ON CONFLICT(chat_id) DO UPDATE SET state = 'AWAITING_QUERY'"
+		)
+			.bind(chatId)
+			.run();
+
+		// Insert 7 active triggers for chatId, plus 1 for another user
+		const insertStmt = env.DB.prepare(
+			`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		);
+		await env.DB.batch([
+			...Array.from({ length: 7 }, (_, i) =>
+				insertStmt.bind(chatId, 600000 + i, `Fund <${i + 1}> & Co`, 100 + i, 10, 110 + i * 1.1, 100 + i)
+			),
+			insertStmt.bind(otherChatId, 600999, "Other User Fund", 100, 10, 110, 100),
+		]);
+
+		const { results: insertedRows } = await env.DB.prepare(
+			"SELECT id, scheme_code FROM tracked_funds WHERE chat_id = ? ORDER BY id ASC"
+		)
+			.bind(chatId)
+			.all<{ id: number; scheme_code: number }>();
+		const otherRow = await env.DB.prepare("SELECT id FROM tracked_funds WHERE chat_id = ?")
+			.bind(otherChatId)
+			.first<{ id: number }>();
+
+		expect(insertedRows).toHaveLength(7);
+		expect(otherRow).not.toBeNull();
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ ok: true }), { status: 200 })
+		);
+
+		const postUpdate = (body: unknown) =>
+			worker.fetch(
+				new IncomingRequest("https://example.com/", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+				{ ...env, BOT_TOKEN: "test-token" }
+			);
+
+		// 1. /delete shows Page 1 of 2 (items 1..5) and Next button
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/delete" } })).status).toBe(200);
+		const userAfterDeleteCmd = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
+			.bind(chatId)
+			.first<{ state: string }>();
+		expect(userAfterDeleteCmd?.state).toBe("IDLE");
+
+		const page1Payload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(page1Payload.parse_mode).toBe("HTML");
+		expect(page1Payload.text).toContain("Page 1 of 2");
+		expect(page1Payload.text).toContain("<b>1.</b> <b>Fund &lt;1&gt; &amp; Co</b>");
+		expect(page1Payload.text).toContain("<b>5.</b> <b>Fund &lt;5&gt; &amp; Co</b>");
+		expect(page1Payload.text).not.toContain("Fund &lt;6&gt;");
+		expect(page1Payload.reply_markup).toEqual({
+			inline_keyboard: [
+				[
+					{ text: "1", callback_data: `DELETE_FUND:${insertedRows[0].id}` },
+					{ text: "2", callback_data: `DELETE_FUND:${insertedRows[1].id}` },
+					{ text: "3", callback_data: `DELETE_FUND:${insertedRows[2].id}` },
+					{ text: "4", callback_data: `DELETE_FUND:${insertedRows[3].id}` },
+					{ text: "5", callback_data: `DELETE_FUND:${insertedRows[4].id}` },
+				],
+				[{ text: "Next ➡️", callback_data: "DELETE_PAGE:1" }],
+			],
+		});
+
+		// 2. Navigate to Page 2 via callback_query -> uses editMessageText with items 6..7 and Prev button
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_page_1",
+						message: { message_id: 9001, chat: { id: chatId } },
+						data: "DELETE_PAGE:1",
+					},
+				})
+			).status
+		).toBe(200);
+
+		const editPage2Call = fetchSpy.mock.calls.find(([url]) => String(url).includes("editMessageText"));
+		expect(editPage2Call).toBeDefined();
+		const page2Payload = JSON.parse(String(editPage2Call?.[1]?.body));
+		expect(page2Payload.message_id).toBe(9001);
+		expect(page2Payload.text).toContain("Page 2 of 2");
+		expect(page2Payload.text).toContain("<b>1.</b> <b>Fund &lt;6&gt; &amp; Co</b>");
+		expect(page2Payload.text).toContain("<b>2.</b> <b>Fund &lt;7&gt; &amp; Co</b>");
+		expect(page2Payload.reply_markup).toEqual({
+			inline_keyboard: [
+				[
+					{ text: "1", callback_data: `DELETE_FUND:${insertedRows[5].id}` },
+					{ text: "2", callback_data: `DELETE_FUND:${insertedRows[6].id}` },
+				],
+				[{ text: "⬅️ Prev", callback_data: "DELETE_PAGE:0" }],
+			],
+		});
+
+		// 3. Cannot delete another user's trigger
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_other",
+						message: { message_id: 9001, chat: { id: chatId } },
+						data: `DELETE_FUND:${otherRow!.id}`,
+					},
+				})
+			).status
+		).toBe(200);
+		const otherRowAfter = await env.DB.prepare("SELECT is_deleted FROM tracked_funds WHERE id = ?")
+			.bind(otherRow!.id)
+			.first<{ is_deleted: number }>();
+		expect(otherRowAfter?.is_deleted).toBe(0);
+
+		// 4. Select item 1 on Page 2 (6th fund) to soft-delete it
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_del_6",
+						message: { message_id: 9001, chat: { id: chatId } },
+						data: `DELETE_FUND:${insertedRows[5].id}`,
+					},
+				})
+			).status
+		).toBe(200);
+
+		const deletedPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(deletedPayload.text).toContain("Target Deleted!");
+		expect(deletedPayload.text).toContain("Fund &lt;6&gt; &amp; Co");
+		expect(deletedPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+		// Row still exists in DB with is_deleted = 1 (soft delete)
+		const deletedRow = await env.DB.prepare("SELECT is_deleted, is_triggered FROM tracked_funds WHERE id = ?")
+			.bind(insertedRows[5].id)
+			.first<{ is_deleted: number; is_triggered: number }>();
+		expect(deletedRow).toEqual({ is_deleted: 1, is_triggered: 0 });
+
+		// 5. Re-clicking the same delete button reports already deleted cleanly
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_del_6_again",
+						message: { message_id: 9001, chat: { id: chatId } },
+						data: `DELETE_FUND:${insertedRows[5].id}`,
+					},
+				})
+			).status
+		).toBe(200);
+		const alreadyDeletedPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(alreadyDeletedPayload.text).toContain("already deleted");
+
+		// 6. /list excludes soft-deleted trigger
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/list" } })).status).toBe(200);
+		const listPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(listPayload.text).not.toContain("Fund &lt;6&gt;");
+		expect(listPayload.text).toContain("Fund &lt;7&gt;");
+	});
+
+	it("scheduled cron ignores soft-deleted targets for NAV lookup, alerts, and updates", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+
+		await env.DB.batch([
+			// Scheme 700001 has ONLY a soft-deleted row -> should NOT fetch MFapi at all
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_deleted)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(7001, 700001, "Only Deleted Fund", 100, 5, 105, 100, 1),
+			// Scheme 700002 has one active row and one soft-deleted row -> only active row alerted & updated
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_deleted)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(7002, 700002, "Shared Active Fund", 100, 10, 110, 100, 0),
+			env.DB.prepare(
+				`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav, is_deleted)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(7003, 700002, "Shared Deleted Fund", 100, 5, 105, 100, 1),
+		]);
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/700002/latest")) {
+				return new Response(JSON.stringify({ data: [{ nav: "120.00" }] }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const ctx = createExecutionContext();
+		await worker.scheduled({} as ScheduledController, { ...env, BOT_TOKEN: "test-token" }, ctx);
+		await waitOnExecutionContext(ctx);
+
+		const navCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("api.mfapi.in/mf/"));
+		expect(navCalls).toHaveLength(1);
+		expect(String(navCalls[0][0])).toBe("https://api.mfapi.in/mf/700002/latest");
+
+		const messageCalls = fetchSpy.mock.calls.filter(([url]) => String(url).includes("sendMessage"));
+		expect(messageCalls).toHaveLength(1);
+		expect(JSON.parse(String(messageCalls[0][1]?.body)).chat_id).toBe(7002);
+
+		const { results: rows } = await env.DB.prepare(
+			"SELECT chat_id, last_nav, is_triggered, is_deleted FROM tracked_funds ORDER BY chat_id"
+		).all<{ chat_id: number; last_nav: number; is_triggered: number; is_deleted: number }>();
+
+		expect(rows).toEqual([
+			{ chat_id: 7001, last_nav: 100, is_triggered: 0, is_deleted: 1 },
+			{ chat_id: 7002, last_nav: 120, is_triggered: 1, is_deleted: 0 },
+			{ chat_id: 7003, last_nav: 100, is_triggered: 0, is_deleted: 1 },
+		]);
 	});
 });

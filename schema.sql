@@ -16,5 +16,6 @@ CREATE TABLE IF NOT EXISTS tracked_funds (
     target_nav REAL NOT NULL,
     last_nav REAL,
     is_triggered INTEGER DEFAULT 0,
+    is_deleted INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
