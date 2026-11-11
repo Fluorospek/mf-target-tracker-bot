@@ -18,15 +18,34 @@ interface InlineKeyboardButton {
 	callback_data: string;
 }
 
+type InlineKeyboardMarkup = {
+	inline_keyboard: InlineKeyboardButton[][];
+};
+
+interface UserRow {
+	chat_id: number;
+	state: string;
+	temp_scheme_code: number | null;
+	temp_scheme_name: string | null;
+	temp_base_nav: number | null;
+}
+
 interface DeletePagePayload {
 	text: string;
-	replyMarkup: { inline_keyboard: InlineKeyboardButton[][] };
+	replyMarkup: InlineKeyboardMarkup;
 }
 
 const DELETE_PAGE_SIZE = 5;
 
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Builds the inline keyboard containing the 'Current' button for setting base NAV. */
+function buildCurrentNavMarkup(schemeCode: string | number): InlineKeyboardMarkup {
+	return {
+		inline_keyboard: [[{ text: "Current", callback_data: `SET_CURRENT_NAV:${schemeCode}` }]],
+	};
 }
 
 /** Formats a tracked fund row's scheme name, baseline NAV, and target details as Telegram HTML. */
@@ -106,6 +125,50 @@ async function sendOrEditMessage(
 	}
 }
 
+/** Fetches the persisted conversation state for a chat. */
+async function getUserState(db: D1Database, chatId: number): Promise<UserRow | null> {
+	return db
+		.prepare("SELECT chat_id, state, temp_scheme_code, temp_scheme_name, temp_base_nav FROM users WHERE chat_id = ?")
+		.bind(chatId)
+		.first<UserRow>();
+}
+
+/** Resets state to IDLE and notifies the user when cached current NAV is missing or invalid. */
+async function resetInvalidCurrentNav(env: Env, chatId: number, messageId?: number): Promise<void> {
+	await env.DB.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ?").bind(chatId).run();
+	await sendOrEditMessage(
+		env.BOT_TOKEN,
+		chatId,
+		messageId,
+		"Could not determine the current NAV for this fund. Please try /add again.",
+		{},
+		messageId != null
+	);
+}
+
+/** Persists the selected baseline NAV and prompts the user for the target gain percentage. */
+async function confirmBaseNavAndPromptTarget(
+	env: Env,
+	chatId: number,
+	baseNav: number,
+	schemeName?: string | null,
+	messageId?: number
+): Promise<void> {
+	await env.DB.prepare("UPDATE users SET state = 'AWAITING_TARGET_PCT', temp_base_nav = ? WHERE chat_id = ?")
+		.bind(baseNav, chatId)
+		.run();
+
+	const fundPrefix = schemeName ? `Fund: <b>${escapeHtml(String(schemeName))}</b>\n` : "";
+	await sendOrEditMessage(
+		env.BOT_TOKEN,
+		chatId,
+		messageId,
+		`${fundPrefix}Base NAV set to ₹${baseNav.toFixed(2)}.\n\nNow enter your target gain percentage (e.g., enter <code>10</code> for 10%):`,
+		{ parse_mode: "HTML" },
+		messageId != null
+	);
+}
+
 /** Builds a paginated 5-item selection message and inline keyboard for active targets in a chat. */
 async function buildDeletePagePayload(
 	db: D1Database,
@@ -181,7 +244,7 @@ export default {
 		try {
 			const update: any = await request.json();
 
-			// Handle button clicks (Callback Queries for fund selection & deletion)
+			// Handle button clicks (Callback Queries for fund selection, base NAV, & deletion)
 			if (update.callback_query) {
 				const query = update.callback_query;
 				const chatId = query.message?.chat?.id;
@@ -208,7 +271,7 @@ export default {
 					const schemeName: string | undefined = fundData?.meta?.scheme_name;
 					const latestNav = latestEntry ? parseFloat(latestEntry.nav) : NaN;
 
-					if (!schemeName || isNaN(latestNav)) {
+					if (!schemeName || isNaN(latestNav) || latestNav <= 0) {
 						await sendMessage(
 							env.BOT_TOKEN,
 							chatId,
@@ -230,9 +293,55 @@ export default {
 					await sendMessage(
 						env.BOT_TOKEN,
 						chatId,
-						`Selected: <b>${escapeHtml(schemeName)}</b>\nLatest NAV: ₹${latestNav.toFixed(2)}\n\nEnter your purchase NAV (or reply <b>current</b> to track from today):`,
-						{ parse_mode: "HTML" }
+						`Selected: <b>${escapeHtml(schemeName)}</b>\nLatest NAV: ₹${latestNav.toFixed(2)}\n\nEnter your purchase NAV, or tap <b>Current</b> to track from today:`,
+						{
+							parse_mode: "HTML",
+							reply_markup: buildCurrentNavMarkup(schemeCode),
+						}
 					);
+					return new Response("OK");
+				}
+
+				if (action === "SET_CURRENT_NAV") {
+					const userState = await getUserState(env.DB, chatId);
+
+					if (!userState || userState.state !== "AWAITING_BASE_NAV") {
+						const expiredText =
+							userState?.state === "AWAITING_TARGET_PCT" &&
+							userState.temp_base_nav != null &&
+							Number.isFinite(Number(userState.temp_base_nav))
+								? `Base NAV is already set to ₹${Number(userState.temp_base_nav).toFixed(2)}. Please enter your target gain percentage (e.g., enter <code>10</code> for 10%):`
+								: "This prompt has expired. Please use /add to start tracking a fund.";
+						await sendOrEditMessage(
+							env.BOT_TOKEN,
+							chatId,
+							messageId,
+							expiredText,
+							{ parse_mode: "HTML" },
+							true
+						);
+						return new Response("OK");
+					}
+
+					if (arg && String(userState.temp_scheme_code) !== arg) {
+						await sendOrEditMessage(
+							env.BOT_TOKEN,
+							chatId,
+							messageId,
+							"This prompt has expired because you selected another fund.",
+							{},
+							true
+						);
+						return new Response("OK");
+					}
+
+					const baseNav = Number(userState.temp_base_nav);
+					if (!Number.isFinite(baseNav) || baseNav <= 0) {
+						await resetInvalidCurrentNav(env, chatId, messageId);
+						return new Response("OK");
+					}
+
+					await confirmBaseNavAndPromptTarget(env, chatId, baseNav, userState.temp_scheme_name, messageId);
 					return new Response("OK");
 				}
 
@@ -331,7 +440,7 @@ export default {
 						"ℹ️ <b>How to use Mutual Fund Target Tracker:</b>\n\n" +
 						"1. Send /add and type a fund name (e.g., <code>Parag Parikh Flexi</code>).\n" +
 						"2. Tap your fund from the search results.\n" +
-						"3. Enter your purchase NAV (or reply <code>current</code>).\n" +
+						"3. Enter your purchase NAV (or tap <b>Current</b>).\n" +
 						"4. Enter your target gain % (e.g., <code>10</code> for +10%).\n\n" +
 						"Use /list anytime to view active targets or /delete to remove one. Funds are checked daily at 7:00 AM IST.",
 						{ parse_mode: "HTML" }
@@ -394,9 +503,7 @@ export default {
 				}
 
 				// Fetch User Conversation State
-				const userState: any = await env.DB.prepare("SELECT * FROM users WHERE chat_id = ?")
-					.bind(chatId)
-					.first();
+				const userState = await getUserState(env.DB, chatId);
 
 				if (!userState || userState.state === "IDLE") {
 					return new Response("OK");
@@ -450,27 +557,25 @@ export default {
 					if (text.toLowerCase() !== "current") {
 						const parsed = parseFloat(text);
 						if (isNaN(parsed) || parsed <= 0) {
+							const extra: Record<string, unknown> = { parse_mode: "HTML" };
+							if (userState.temp_scheme_code != null) {
+								extra.reply_markup = buildCurrentNavMarkup(userState.temp_scheme_code);
+							}
 							await sendMessage(
 								env.BOT_TOKEN,
 								chatId,
-								"Invalid number. Enter a positive number for NAV (or type <code>current</code>):",
-								{ parse_mode: "HTML" }
+								"Invalid number. Enter a positive number for NAV, or tap <b>Current</b>:",
+								extra
 							);
 							return new Response("OK");
 						}
 						baseNav = parsed;
+					} else if (!Number.isFinite(baseNav) || baseNav <= 0) {
+						await resetInvalidCurrentNav(env, chatId);
+						return new Response("OK");
 					}
 
-					await env.DB.prepare("UPDATE users SET state = 'AWAITING_TARGET_PCT', temp_base_nav = ? WHERE chat_id = ?")
-						.bind(baseNav, chatId)
-						.run();
-
-					await sendMessage(
-						env.BOT_TOKEN,
-						chatId,
-						`Base NAV set to ₹${baseNav.toFixed(2)}.\n\nNow enter your target gain percentage (e.g., enter <code>10</code> for 10%):`,
-						{ parse_mode: "HTML" }
-					);
+					await confirmBaseNavAndPromptTarget(env, chatId, baseNav, userState.temp_scheme_name);
 					return new Response("OK");
 				}
 

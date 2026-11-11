@@ -108,9 +108,11 @@ describe("mf-alert-bot worker", () => {
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
 		const helpBody = JSON.parse(String(fetchSpy.mock.calls[1][1]?.body));
 		expect(helpBody.text).toContain("How to use Mutual Fund Target Tracker");
+		expect(helpBody.text).toContain("tap <b>Current</b>");
+		expect(helpBody.text).not.toContain("reply <code>current</code>");
 	});
 
-	it("supports full /add -> fund selection -> NAV -> target % -> /list flow with HTML escaping", async () => {
+	it("supports full /add -> fund selection -> Current button -> target % -> /list flow with HTML escaping", async () => {
 		const chatId = 55501;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 			const url = String(input);
@@ -151,7 +153,38 @@ describe("mf-alert-bot worker", () => {
 				})
 			).status
 		).toBe(200);
-		expect((await postUpdate({ message: { chat: { id: chatId }, text: "current" } })).status).toBe(200);
+
+		const navPromptCall = fetchSpy.mock.calls.find(
+			([url, init]) =>
+				String(url).includes("sendMessage") && String(init?.body).includes("Enter your purchase NAV")
+		);
+		expect(navPromptCall).toBeDefined();
+		const navPromptPayload = JSON.parse(String(navPromptCall?.[1]?.body));
+		expect(navPromptPayload.text).toContain("tap <b>Current</b>");
+		expect(navPromptPayload.text).not.toContain("reply <b>current</b>");
+		expect(navPromptPayload.reply_markup).toEqual({
+			inline_keyboard: [[{ text: "Current", callback_data: "SET_CURRENT_NAV:122639" }]],
+		});
+
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb2",
+						message: { message_id: 501, chat: { id: chatId } },
+						data: "SET_CURRENT_NAV:122639",
+					},
+				})
+			).status
+		).toBe(200);
+
+		const editCall = fetchSpy.mock.calls.find(([url]) => String(url).includes("editMessageText"));
+		expect(editCall).toBeDefined();
+		const editPayload = JSON.parse(String(editCall?.[1]?.body));
+		expect(editPayload.message_id).toBe(501);
+		expect(editPayload.text).toContain("Base NAV set to ₹80.00.");
+		expect(editPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
 		expect((await postUpdate({ message: { chat: { id: chatId }, text: "10" } })).status).toBe(200);
 		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/list" } })).status).toBe(200);
 
@@ -714,5 +747,123 @@ describe("mf-alert-bot worker", () => {
 			{ chat_id: 7002, last_nav: 120, is_triggered: 1, is_deleted: 0 },
 			{ chat_id: 7003, last_nav: 100, is_triggered: 0, is_deleted: 1 },
 		]);
+	});
+
+	it("includes the Current inline button on invalid base NAV input and handles custom NAV or stale Current clicks", async () => {
+		const chatId = 77889;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/122639/latest")) {
+				return new Response(
+					JSON.stringify({
+						meta: { scheme_name: "Fund One" },
+						data: [{ nav: "100.00" }],
+					}),
+					{ status: 200 }
+				);
+			}
+			if (url.includes("api.mfapi.in/mf/122640/latest")) {
+				return new Response(
+					JSON.stringify({
+						meta: { scheme_name: "Fund Two" },
+						data: [{ nav: "200.00" }],
+					}),
+					{ status: 200 }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const postUpdate = (body: unknown) =>
+			worker.fetch(
+				new IncomingRequest("https://example.com/", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+				{ ...env, BOT_TOKEN: "test-token" }
+			);
+
+		// Clicking Current before selecting any fund is safely ignored with expired message
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_idle",
+						message: { message_id: 700, chat: { id: chatId } },
+						data: "SET_CURRENT_NAV:122639",
+					},
+				})
+			).status
+		).toBe(200);
+		const idleEditPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(idleEditPayload.text).toContain("expired");
+		expect(idleEditPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+		// Select Fund One, then switch to Fund Two -> clicking Fund One's Current button is rejected
+		expect(
+			(
+				await postUpdate({
+					callback_query: { id: "cb_f1", message: { chat: { id: chatId } }, data: "SELECT_FUND:122639" },
+				})
+			).status
+		).toBe(200);
+		expect(
+			(
+				await postUpdate({
+					callback_query: { id: "cb_f2", message: { chat: { id: chatId } }, data: "SELECT_FUND:122640" },
+				})
+			).status
+		).toBe(200);
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_stale_f1",
+						message: { message_id: 701, chat: { id: chatId } },
+						data: "SET_CURRENT_NAV:122639",
+					},
+				})
+			).status
+		).toBe(200);
+		const mismatchPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(mismatchPayload.text).toContain("selected another fund");
+		expect(mismatchPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+		// Invalid NAV entry re-prompts with 'Current' inline button instead of asking to type current
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "not-a-number" } })).status).toBe(200);
+		const retryPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(retryPayload.text).toContain("Invalid number");
+		expect(retryPayload.text).toContain("tap <b>Current</b>");
+		expect(retryPayload.text).not.toContain("type <code>current</code>");
+		expect(retryPayload.reply_markup).toEqual({
+			inline_keyboard: [[{ text: "Current", callback_data: "SET_CURRENT_NAV:122640" }]],
+		});
+
+		// Enter custom NAV (150) -> state moves to AWAITING_TARGET_PCT
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "150" } })).status).toBe(200);
+		const customSetPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(customSetPayload.text).toContain("Base NAV set to ₹150.00");
+
+		// Clicking stale Current button after custom NAV was set does NOT overwrite temp_base_nav
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_stale_f2",
+						message: { message_id: 702, chat: { id: chatId } },
+						data: "SET_CURRENT_NAV:122640",
+					},
+				})
+			).status
+		).toBe(200);
+		const alreadySetPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(alreadySetPayload.text).toContain("already set to ₹150.00");
+		expect(alreadySetPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+		const userRow = await env.DB.prepare("SELECT state, temp_scheme_code, temp_base_nav FROM users WHERE chat_id = ?")
+			.bind(chatId)
+			.first<{ state: string; temp_scheme_code: number; temp_base_nav: number }>();
+		expect(userRow).toEqual({ state: "AWAITING_TARGET_PCT", temp_scheme_code: 122640, temp_base_nav: 150 });
 	});
 });

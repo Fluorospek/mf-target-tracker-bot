@@ -9,7 +9,7 @@ Users interact with the bot on Telegram to search for mutual fund schemes, recor
 ## Features
 
 - **Interactive Fund Search**: Search Indian mutual fund schemes via `api.mfapi.in` and pick from the top 5 matches using inline keyboard buttons.
-- **Flexible Baseline NAV**: Track gains from an existing purchase price by entering a custom NAV, or reply `current` to start from today's latest NAV.
+- **Flexible Baseline NAV**: Track gains from an existing purchase price by entering a custom NAV, or tap the **Current** inline button to start from today's latest NAV.
 - **Percentage Gain Targets**: Automatically calculates the target NAV from the baseline NAV and desired gain percentage (`baseline_nav * (1 + target_pct / 100)`).
 - **Daily Automated Checks**: Runs via a Cloudflare Worker `scheduled` handler (`30 1 * * *` cron) and sends formatted alerts when `target_nav <= current_nav`.
 - **Efficient & Resilient Cron Execution**:
@@ -36,7 +36,7 @@ The bot persists per-user wizard progress in the D1 `users` table:
 
 1. **Search Query (`AWAITING_QUERY`)**: After `/add`, the user enters fund keywords (e.g., `Parag Parikh Flexi` or `Nifty 50`). The bot displays up to 5 matching schemes with numbered inline buttons (`SELECT_FUND:<schemeCode>`).
 2. **Scheme Selection (`callback_query`)**: Tapping a number fetches the scheme's latest NAV and transitions the user to `AWAITING_BASE_NAV`.
-3. **Baseline NAV (`AWAITING_BASE_NAV`)**: The user enters a positive numeric purchase NAV or replies `current` to use the fetched latest NAV.
+3. **Baseline NAV (`AWAITING_BASE_NAV`)**: The user enters a positive numeric purchase NAV or taps the **Current** inline button to use the fetched latest NAV.
 4. **Target Gain % (`AWAITING_TARGET_PCT`)**: The user enters a positive gain percentage (e.g., `10` or `15.5`). The bot saves the target to `tracked_funds`, resets the user's state to `IDLE`, and confirms registration.
 
 ## Tech Stack & Architecture
