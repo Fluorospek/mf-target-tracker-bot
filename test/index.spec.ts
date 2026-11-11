@@ -527,6 +527,11 @@ describe("mf-alert-bot worker", () => {
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		const payload = JSON.parse(String(fetchSpy.mock.calls[0][1]?.body));
 		expect(payload.text).toContain("No active targets to delete");
+
+		const userAfterEmptyDelete = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
+			.bind(chatId)
+			.first<{ state: string }>();
+		expect(userAfterEmptyDelete?.state).toBe("IDLE");
 	});
 
 	it("paginates /delete in pages of 5, soft-deletes selected trigger, and excludes it from /list and cron", async () => {
@@ -534,7 +539,7 @@ describe("mf-alert-bot worker", () => {
 		const chatId = 62001;
 		const otherChatId = 62002;
 
-		// Put user mid-/add flow to verify /delete resets state to IDLE
+		// Put user mid-/add flow to verify /delete switches state to AWAITING_DELETE
 		await env.DB.prepare(
 			"INSERT INTO users (chat_id, state) VALUES (?, 'AWAITING_QUERY') ON CONFLICT(chat_id) DO UPDATE SET state = 'AWAITING_QUERY'"
 		)
@@ -584,7 +589,7 @@ describe("mf-alert-bot worker", () => {
 		const userAfterDeleteCmd = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
 			.bind(chatId)
 			.first<{ state: string }>();
-		expect(userAfterDeleteCmd?.state).toBe("IDLE");
+		expect(userAfterDeleteCmd?.state).toBe("AWAITING_DELETE");
 
 		const page1Payload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
 		expect(page1Payload.parse_mode).toBe("HTML");
@@ -865,5 +870,148 @@ describe("mf-alert-bot worker", () => {
 			.bind(chatId)
 			.first<{ state: string; temp_scheme_code: number; temp_base_nav: number }>();
 		expect(userRow).toEqual({ state: "AWAITING_TARGET_PCT", temp_scheme_code: 122640, temp_base_nav: 150 });
+	});
+
+	it("expires /delete inline prompts when the user moves on to another command", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+		await env.DB.prepare("DELETE FROM users").run();
+
+		const chatId = 63001;
+		const insertStmt = env.DB.prepare(
+			`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		);
+		await env.DB.batch(
+			Array.from({ length: 6 }, (_, i) =>
+				insertStmt.bind(chatId, 710000 + i, `Expire Test Fund ${i + 1}`, 100, 10, 110, 100)
+			)
+		);
+
+		const { results: funds } = await env.DB.prepare(
+			"SELECT id FROM tracked_funds WHERE chat_id = ? ORDER BY id ASC"
+		)
+			.bind(chatId)
+			.all<{ id: number }>();
+		expect(funds).toHaveLength(6);
+
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ ok: true }), { status: 200 })
+		);
+
+		const postUpdate = (body: unknown) =>
+			worker.fetch(
+				new IncomingRequest("https://example.com/", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+				{ ...env, BOT_TOKEN: "test-token" }
+			);
+
+		for (const nextCommand of ["/list", "/help", "/start", "/add", "/unknown"]) {
+			expect((await postUpdate({ message: { chat: { id: chatId }, text: "/delete" } })).status).toBe(200);
+			expect((await postUpdate({ message: { chat: { id: chatId }, text: nextCommand } })).status).toBe(200);
+
+			// Trying to delete a fund via stale /delete inline button reports prompt expired and does not delete
+			expect(
+				(
+					await postUpdate({
+						callback_query: {
+							id: `cb_expired_del_${nextCommand}`,
+							message: { message_id: 9101, chat: { id: chatId } },
+							data: `DELETE_FUND:${funds[0].id}`,
+						},
+					})
+				).status
+			).toBe(200);
+			const expiredDeletePayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+			expect(expiredDeletePayload.message_id).toBe(9101);
+			expect(expiredDeletePayload.text).toContain("prompt has expired");
+			expect(expiredDeletePayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+			// Trying to paginate stale /delete inline button also reports prompt expired
+			expect(
+				(
+					await postUpdate({
+						callback_query: {
+							id: `cb_expired_page_${nextCommand}`,
+							message: { message_id: 9102, chat: { id: chatId } },
+							data: "DELETE_PAGE:1",
+						},
+					})
+				).status
+			).toBe(200);
+			const expiredPagePayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+			expect(expiredPagePayload.message_id).toBe(9102);
+			expect(expiredPagePayload.text).toContain("prompt has expired");
+			expect(expiredPagePayload.reply_markup).toEqual({ inline_keyboard: [] });
+		}
+
+		// Verify none of the funds were deleted across all expired attempts
+		const activeCount = await env.DB.prepare(
+			"SELECT COUNT(*) as total FROM tracked_funds WHERE chat_id = ? AND is_deleted = 0"
+		)
+			.bind(chatId)
+			.first<{ total: number }>();
+		expect(activeCount?.total).toBe(6);
+
+		// Non-command plain text during AWAITING_DELETE does not expire the prompt; deleting still succeeds
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/delete" } })).status).toBe(200);
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "random text" } })).status).toBe(200);
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_valid_del",
+						message: { message_id: 9103, chat: { id: chatId } },
+						data: `DELETE_FUND:${funds[0].id}`,
+					},
+				})
+			).status
+		).toBe(200);
+		const validDeletePayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(validDeletePayload.text).toContain("Target Deleted!");
+
+		// Tapping a different active fund button after a delete already completed is rejected as expired
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_second_del",
+						message: { message_id: 9103, chat: { id: chatId } },
+						data: `DELETE_FUND:${funds[1].id}`,
+					},
+				})
+			).status
+		).toBe(200);
+		const secondDeletePayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(secondDeletePayload.text).toContain("prompt has expired");
+
+		// Moving to /list after deletion expires stale re-clicks of the deleted button too
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/list" } })).status).toBe(200);
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_reclick_after_list",
+						message: { message_id: 9103, chat: { id: chatId } },
+						data: `DELETE_FUND:${funds[0].id}`,
+					},
+				})
+			).status
+		).toBe(200);
+		const reclickAfterListPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(reclickAfterListPayload.text).toContain("prompt has expired");
+
+		// Fund 0 is deleted, Fund 1 remains active
+		const rowsAfter = await env.DB.prepare(
+			"SELECT id, is_deleted FROM tracked_funds WHERE id IN (?, ?) ORDER BY id ASC"
+		)
+			.bind(funds[0].id, funds[1].id)
+			.all<{ id: number; is_deleted: number }>();
+		expect(rowsAfter.results).toEqual([
+			{ id: funds[0].id, is_deleted: 1 },
+			{ id: funds[1].id, is_deleted: 0 },
+		]);
 	});
 });

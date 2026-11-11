@@ -36,6 +36,7 @@ interface DeletePagePayload {
 }
 
 const DELETE_PAGE_SIZE = 5;
+const DELETE_PROMPT_EXPIRED_TEXT = "This prompt has expired. Please use /delete to select a target to delete.";
 
 function escapeHtml(text: string): string {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -133,9 +134,33 @@ async function getUserState(db: D1Database, chatId: number): Promise<UserRow | n
 		.first<UserRow>();
 }
 
+/** Persists the conversation state for a chat, creating the user row if missing. */
+async function setUserState(db: D1Database, chatId: number, state: string): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO users (chat_id, state) VALUES (?, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET state = ?`
+		)
+		.bind(chatId, state, state)
+		.run();
+}
+
+/** Expires any pending delete prompt when the user moves on to another command. */
+async function clearPendingDeleteState(db: D1Database, chatId: number): Promise<void> {
+	await db
+		.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ? AND state IN ('AWAITING_DELETE', 'DELETE_COMPLETED')")
+		.bind(chatId)
+		.run();
+}
+
+/** Notifies the user that a delete prompt has expired and removes its inline keyboard. */
+async function sendExpiredDeletePrompt(token: string, chatId: number, messageId?: number): Promise<void> {
+	await sendOrEditMessage(token, chatId, messageId, DELETE_PROMPT_EXPIRED_TEXT, {}, true);
+}
+
 /** Resets state to IDLE and notifies the user when cached current NAV is missing or invalid. */
 async function resetInvalidCurrentNav(env: Env, chatId: number, messageId?: number): Promise<void> {
-	await env.DB.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ?").bind(chatId).run();
+	await setUserState(env.DB, chatId, "IDLE");
 	await sendOrEditMessage(
 		env.BOT_TOKEN,
 		chatId,
@@ -346,9 +371,16 @@ export default {
 				}
 
 				if (action === "DELETE_PAGE" && arg && /^\d+$/.test(arg)) {
+					const userState = await getUserState(env.DB, chatId);
+					if (!userState || userState.state !== "AWAITING_DELETE") {
+						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						return new Response("OK");
+					}
+
 					const page = Number(arg);
 					const payload = await buildDeletePagePayload(env.DB, chatId, page);
 					if (!payload) {
+						await setUserState(env.DB, chatId, "IDLE");
 						await sendOrEditMessage(
 							env.BOT_TOKEN,
 							chatId,
@@ -368,6 +400,15 @@ export default {
 				}
 
 				if (action === "DELETE_FUND" && arg && /^\d+$/.test(arg)) {
+					const userState = await getUserState(env.DB, chatId);
+					if (
+						!userState ||
+						(userState.state !== "AWAITING_DELETE" && userState.state !== "DELETE_COMPLETED")
+					) {
+						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						return new Response("OK");
+					}
+
 					const fundId = Number(arg);
 					const target = await env.DB.prepare(
 						`SELECT id, chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav
@@ -377,13 +418,19 @@ export default {
 						.bind(fundId, chatId)
 						.first<TrackedFundRow>();
 
-					const deleteResult = target
-						? await env.DB.prepare(
-								"UPDATE tracked_funds SET is_deleted = 1 WHERE id = ? AND chat_id = ? AND is_triggered = 0 AND is_deleted = 0"
-						  )
-								.bind(fundId, chatId)
-								.run()
-						: null;
+					if (userState.state === "DELETE_COMPLETED" && target) {
+						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						return new Response("OK");
+					}
+
+					const deleteResult =
+						userState.state === "AWAITING_DELETE" && target
+							? await env.DB.prepare(
+									"UPDATE tracked_funds SET is_deleted = 1 WHERE id = ? AND chat_id = ? AND is_triggered = 0 AND is_deleted = 0"
+							  )
+									.bind(fundId, chatId)
+									.run()
+							: null;
 
 					if (!target || !deleteResult?.meta.changes) {
 						await sendOrEditMessage(
@@ -397,6 +444,7 @@ export default {
 						return new Response("OK");
 					}
 
+					await setUserState(env.DB, chatId, "DELETE_COMPLETED");
 					await sendOrEditMessage(
 						env.BOT_TOKEN,
 						chatId,
@@ -417,13 +465,12 @@ export default {
 				const text: string = update.message.text.trim();
 				const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : null;
 
+				if (command && command !== "/delete" && command !== "/start" && command !== "/add") {
+					await clearPendingDeleteState(env.DB, chatId);
+				}
+
 				if (command === "/start") {
-					await env.DB.prepare(
-						`INSERT INTO users (chat_id, state) VALUES (?, 'IDLE')
-             ON CONFLICT(chat_id) DO UPDATE SET state = 'IDLE'`
-					)
-						.bind(chatId)
-						.run();
+					await setUserState(env.DB, chatId, "IDLE");
 
 					await sendMessage(
 						env.BOT_TOKEN,
@@ -449,12 +496,7 @@ export default {
 				}
 
 				if (command === "/add") {
-					await env.DB.prepare(
-						`INSERT INTO users (chat_id, state) VALUES (?, 'AWAITING_QUERY')
-             ON CONFLICT(chat_id) DO UPDATE SET state = 'AWAITING_QUERY'`
-					)
-						.bind(chatId)
-						.run();
+					await setUserState(env.DB, chatId, "AWAITING_QUERY");
 
 					await sendMessage(
 						env.BOT_TOKEN,
@@ -487,14 +529,14 @@ export default {
 				}
 
 				if (command === "/delete") {
-					await env.DB.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ?").bind(chatId).run();
-
 					const payload = await buildDeletePagePayload(env.DB, chatId, 0);
 					if (!payload) {
+						await setUserState(env.DB, chatId, "IDLE");
 						await sendMessage(env.BOT_TOKEN, chatId, "No active targets to delete. Use /add to start tracking.");
 						return new Response("OK");
 					}
 
+					await setUserState(env.DB, chatId, "AWAITING_DELETE");
 					await sendMessage(env.BOT_TOKEN, chatId, payload.text, {
 						parse_mode: "HTML",
 						reply_markup: payload.replyMarkup,
@@ -613,7 +655,7 @@ export default {
 						.run();
 
 					// Reset user state to IDLE
-					await env.DB.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ?").bind(chatId).run();
+					await setUserState(env.DB, chatId, "IDLE");
 
 					await sendMessage(
 						env.BOT_TOKEN,

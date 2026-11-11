@@ -54,7 +54,7 @@ The bot persists per-user wizard progress in the D1 `users` table:
 
 Defined in [`schema.sql`](./schema.sql):
 
-- **`users`**: Stores per-chat conversation state (`IDLE`, `AWAITING_QUERY`, `AWAITING_BASE_NAV`, `AWAITING_TARGET_PCT`) and temporary selections (`temp_scheme_code`, `temp_scheme_name`, `temp_base_nav`) during `/add`.
+- **`users`**: Stores per-chat conversation state (`IDLE`, `AWAITING_QUERY`, `AWAITING_BASE_NAV`, `AWAITING_TARGET_PCT`, `AWAITING_DELETE`, `DELETE_COMPLETED`) and temporary selections (`temp_scheme_code`, `temp_scheme_name`, `temp_base_nav`) during `/add`.
 - **`tracked_funds`**: Stores registered alerts (`chat_id`, `scheme_code`, `scheme_name`, `baseline_nav`, `target_pct`, `target_nav`, `last_nav`, `is_triggered`, `is_deleted`, `created_at`).
 
 ## Project Structure
