@@ -34,8 +34,8 @@ Commands support optional `@botname` suffixes (for example, `/start@your_bot_nam
 
 The bot persists per-user wizard progress in the D1 `users` table:
 
-1. **Search Query (`AWAITING_QUERY`)**: After `/add`, the user enters fund keywords (e.g., `Parag Parikh Flexi` or `Nifty 50`). The bot displays up to 5 matching schemes with numbered inline buttons (`SELECT_FUND:<schemeCode>`).
-2. **Scheme Selection (`callback_query`)**: Tapping a number fetches the scheme's latest NAV and transitions the user to `AWAITING_BASE_NAV`.
+1. **Search Query (`AWAITING_QUERY`)**: After `/add`, the user enters fund keywords (e.g., `Parag Parikh Flexi` or `Nifty 50`). The bot displays up to 5 matching schemes with numbered inline buttons (`SELECT_FUND:<schemeCode>`) and transitions to `AWAITING_FUND_SELECTION`.
+2. **Scheme Selection (`AWAITING_FUND_SELECTION`, `callback_query`)**: Tapping a number fetches the scheme's latest NAV and transitions the user to `AWAITING_BASE_NAV` (moving onto another command expires the prompt).
 3. **Baseline NAV (`AWAITING_BASE_NAV`)**: The user enters a positive numeric purchase NAV or taps the **Current** inline button to use the fetched latest NAV.
 4. **Target Gain % (`AWAITING_TARGET_PCT`)**: The user enters a positive gain percentage (e.g., `10` or `15.5`). The bot saves the target to `tracked_funds`, resets the user's state to `IDLE`, and confirms registration.
 
@@ -54,7 +54,7 @@ The bot persists per-user wizard progress in the D1 `users` table:
 
 Defined in [`schema.sql`](./schema.sql):
 
-- **`users`**: Stores per-chat conversation state (`IDLE`, `AWAITING_QUERY`, `AWAITING_BASE_NAV`, `AWAITING_TARGET_PCT`, `AWAITING_DELETE`, `DELETE_COMPLETED`) and temporary selections (`temp_scheme_code`, `temp_scheme_name`, `temp_base_nav`) during `/add`.
+- **`users`**: Stores per-chat conversation state (`IDLE`, `AWAITING_QUERY`, `AWAITING_FUND_SELECTION`, `AWAITING_BASE_NAV`, `AWAITING_TARGET_PCT`, `AWAITING_DELETE`, `DELETE_COMPLETED`) and temporary selections (`temp_scheme_code`, `temp_scheme_name`, `temp_base_nav`) during `/add`.
 - **`tracked_funds`**: Stores registered alerts (`chat_id`, `scheme_code`, `scheme_name`, `baseline_nav`, `target_pct`, `target_nav`, `last_nav`, `is_triggered`, `is_deleted`, `created_at`).
 
 ## Project Structure

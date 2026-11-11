@@ -758,6 +758,15 @@ describe("mf-alert-bot worker", () => {
 		const chatId = 77889;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/search")) {
+				return new Response(
+					JSON.stringify([
+						{ schemeCode: 122639, schemeName: "Fund One" },
+						{ schemeCode: 122640, schemeName: "Fund Two" },
+					]),
+					{ status: 200 }
+				);
+			}
 			if (url.includes("api.mfapi.in/mf/122639/latest")) {
 				return new Response(
 					JSON.stringify({
@@ -805,7 +814,9 @@ describe("mf-alert-bot worker", () => {
 		expect(idleEditPayload.text).toContain("expired");
 		expect(idleEditPayload.reply_markup).toEqual({ inline_keyboard: [] });
 
-		// Select Fund One, then switch to Fund Two -> clicking Fund One's Current button is rejected
+		// Start /add search flow, select Fund One, then switch to Fund Two -> clicking Fund One's Current button is rejected
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/add" } })).status).toBe(200);
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "Fund" } })).status).toBe(200);
 		expect(
 			(
 				await postUpdate({
@@ -1013,5 +1024,192 @@ describe("mf-alert-bot worker", () => {
 			{ id: funds[0].id, is_deleted: 1 },
 			{ id: funds[1].id, is_deleted: 0 },
 		]);
+	});
+
+	it("expires /add fund-selection inline prompts when the user moves on to another command", async () => {
+		await env.DB.prepare("DELETE FROM tracked_funds").run();
+		await env.DB.prepare("DELETE FROM users").run();
+
+		const chatId = 64001;
+		await env.DB.prepare(
+			`INSERT INTO tracked_funds (chat_id, scheme_code, scheme_name, baseline_nav, target_pct, target_nav, last_nav)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		)
+			.bind(chatId, 122639, "Existing Tracked Fund", 100, 10, 110, 100)
+			.run();
+
+		let latestFetchCount = 0;
+		let searchFetchCount = 0;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+			const url = String(input);
+			if (url.includes("api.mfapi.in/mf/search")) {
+				searchFetchCount++;
+				return new Response(
+					JSON.stringify([
+						{ schemeCode: 122639, schemeName: "Parag Parikh Flexi Cap" },
+						{ schemeCode: 122640, schemeName: "Parag Parikh Tax Saver" },
+					]),
+					{ status: 200 }
+				);
+			}
+			if (url.includes("api.mfapi.in/mf/122639/latest")) {
+				latestFetchCount++;
+				return new Response(
+					JSON.stringify({
+						meta: { scheme_name: "Parag Parikh Flexi Cap" },
+						data: [{ nav: "80.00" }],
+					}),
+					{ status: 200 }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		});
+
+		const postUpdate = (body: unknown) =>
+			worker.fetch(
+				new IncomingRequest("https://example.com/", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+				{ ...env, BOT_TOKEN: "test-token" }
+			);
+
+		// Clicking a stale SELECT_FUND button before any /add flow is expired
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_idle_select",
+						message: { message_id: 9200, chat: { id: chatId } },
+						data: "SELECT_FUND:122639",
+					},
+				})
+			).status
+		).toBe(200);
+		const idleSelectPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(idleSelectPayload.message_id).toBe(9200);
+		expect(idleSelectPayload.text).toContain("prompt has expired");
+		expect(idleSelectPayload.text).toContain("/add");
+		expect(idleSelectPayload.reply_markup).toEqual({ inline_keyboard: [] });
+		expect(latestFetchCount).toBe(0);
+
+		const commandTransitions: Array<{ command: string; expectedState: string }> = [
+			{ command: "/list", expectedState: "IDLE" },
+			{ command: "/help", expectedState: "IDLE" },
+			{ command: "/start", expectedState: "IDLE" },
+			{ command: "/delete", expectedState: "AWAITING_DELETE" },
+			{ command: "/add", expectedState: "AWAITING_QUERY" },
+			{ command: "/unknown", expectedState: "IDLE" },
+		];
+
+		for (const { command, expectedState } of commandTransitions) {
+			expect((await postUpdate({ message: { chat: { id: chatId }, text: "/add" } })).status).toBe(200);
+			expect((await postUpdate({ message: { chat: { id: chatId }, text: "Parag" } })).status).toBe(200);
+
+			const stateAfterSearch = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
+				.bind(chatId)
+				.first<{ state: string }>();
+			expect(stateAfterSearch?.state).toBe("AWAITING_FUND_SELECTION");
+
+			expect((await postUpdate({ message: { chat: { id: chatId }, text: command } })).status).toBe(200);
+
+			const stateAfterCmd = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
+				.bind(chatId)
+				.first<{ state: string }>();
+			expect(stateAfterCmd?.state).toBe(expectedState);
+
+			// Trying to select a fund from the stale fetched-funds prompt reports expired and removes inline buttons
+			expect(
+				(
+					await postUpdate({
+						callback_query: {
+							id: `cb_expired_select_${command}`,
+							message: { message_id: 9201, chat: { id: chatId } },
+							data: "SELECT_FUND:122639",
+						},
+					})
+				).status
+			).toBe(200);
+
+			const expiredSelectPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+			expect(expiredSelectPayload.message_id).toBe(9201);
+			expect(expiredSelectPayload.text).toContain("prompt has expired");
+			expect(expiredSelectPayload.text).toContain("/add");
+			expect(expiredSelectPayload.reply_markup).toEqual({ inline_keyboard: [] });
+
+			// Stale click did not fetch latest NAV or overwrite the new command's state
+			expect(latestFetchCount).toBe(0);
+			const stateAfterExpiredClick = await env.DB.prepare("SELECT state FROM users WHERE chat_id = ?")
+				.bind(chatId)
+				.first<{ state: string }>();
+			expect(stateAfterExpiredClick?.state).toBe(expectedState);
+		}
+
+		// Non-command plain text during AWAITING_FUND_SELECTION does not expire the prompt or re-search; selecting still succeeds
+		const searchesBeforePlainText = searchFetchCount;
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "/add" } })).status).toBe(200);
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "Parag" } })).status).toBe(200);
+		expect(searchFetchCount).toBe(searchesBeforePlainText + 1);
+
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "random text" } })).status).toBe(200);
+		expect(searchFetchCount).toBe(searchesBeforePlainText + 1);
+
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_valid_select",
+						message: { message_id: 9202, chat: { id: chatId } },
+						data: "SELECT_FUND:122639",
+					},
+				})
+			).status
+		).toBe(200);
+		expect(latestFetchCount).toBe(1);
+		const selectedPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(selectedPayload.text).toContain("Selected: <b>Parag Parikh Flexi Cap</b>");
+
+		// Advancing to AWAITING_TARGET_PCT expires stale clicks on the earlier fund-selection buttons without disrupting target %
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "80" } })).status).toBe(200);
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_stale_after_nav",
+						message: { message_id: 9203, chat: { id: chatId } },
+						data: "SELECT_FUND:122640",
+					},
+				})
+			).status
+		).toBe(200);
+		const staleAfterNavPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(staleAfterNavPayload.message_id).toBe(9203);
+		expect(staleAfterNavPayload.text).toContain("prompt has expired");
+		expect(staleAfterNavPayload.reply_markup).toEqual({ inline_keyboard: [] });
+		expect(latestFetchCount).toBe(1);
+
+		// Completing the target registration still succeeds and returns state to IDLE
+		expect((await postUpdate({ message: { chat: { id: chatId }, text: "10" } })).status).toBe(200);
+		const registeredPayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(registeredPayload.text).toContain("Target Registered!");
+
+		// Clicking SELECT_FUND after completing /add also reports prompt has expired
+		expect(
+			(
+				await postUpdate({
+					callback_query: {
+						id: "cb_stale_after_complete",
+						message: { message_id: 9204, chat: { id: chatId } },
+						data: "SELECT_FUND:122639",
+					},
+				})
+			).status
+		).toBe(200);
+		const staleAfterCompletePayload = JSON.parse(String(fetchSpy.mock.calls.at(-1)?.[1]?.body));
+		expect(staleAfterCompletePayload.message_id).toBe(9204);
+		expect(staleAfterCompletePayload.text).toContain("prompt has expired");
+		expect(staleAfterCompletePayload.reply_markup).toEqual({ inline_keyboard: [] });
+		expect(latestFetchCount).toBe(1);
 	});
 });

@@ -36,6 +36,7 @@ interface DeletePagePayload {
 }
 
 const DELETE_PAGE_SIZE = 5;
+const ADD_PROMPT_EXPIRED_TEXT = "This prompt has expired. Please use /add to start tracking a fund.";
 const DELETE_PROMPT_EXPIRED_TEXT = "This prompt has expired. Please use /delete to select a target to delete.";
 
 function escapeHtml(text: string): string {
@@ -145,17 +146,14 @@ async function setUserState(db: D1Database, chatId: number, state: string): Prom
 		.run();
 }
 
-/** Expires any pending delete prompt when the user moves on to another command. */
-async function clearPendingDeleteState(db: D1Database, chatId: number): Promise<void> {
-	await db
-		.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ? AND state IN ('AWAITING_DELETE', 'DELETE_COMPLETED')")
-		.bind(chatId)
-		.run();
+/** Resets any active conversation or prompt state to IDLE when the user moves on to another command. */
+async function clearPendingState(db: D1Database, chatId: number): Promise<void> {
+	await db.prepare("UPDATE users SET state = 'IDLE' WHERE chat_id = ? AND state != 'IDLE'").bind(chatId).run();
 }
 
-/** Notifies the user that a delete prompt has expired and removes its inline keyboard. */
-async function sendExpiredDeletePrompt(token: string, chatId: number, messageId?: number): Promise<void> {
-	await sendOrEditMessage(token, chatId, messageId, DELETE_PROMPT_EXPIRED_TEXT, {}, true);
+/** Notifies the user that an inline prompt has expired and removes its inline keyboard. */
+async function sendExpiredPrompt(token: string, chatId: number, text: string, messageId?: number): Promise<void> {
+	await sendOrEditMessage(token, chatId, messageId, text, {}, true);
 }
 
 /** Resets state to IDLE and notifies the user when cached current NAV is missing or invalid. */
@@ -289,6 +287,15 @@ export default {
 				const [action, arg] = data.split(":");
 
 				if (action === "SELECT_FUND" && arg) {
+					const userState = await getUserState(env.DB, chatId);
+					if (
+						!userState ||
+						(userState.state !== "AWAITING_FUND_SELECTION" && userState.state !== "AWAITING_BASE_NAV")
+					) {
+						await sendExpiredPrompt(env.BOT_TOKEN, chatId, ADD_PROMPT_EXPIRED_TEXT, messageId);
+						return new Response("OK");
+					}
+
 					const schemeCode = arg;
 					const res = await fetch(`https://api.mfapi.in/mf/${encodeURIComponent(schemeCode)}/latest`);
 					const fundData: any = await res.json();
@@ -297,6 +304,7 @@ export default {
 					const latestNav = latestEntry ? parseFloat(latestEntry.nav) : NaN;
 
 					if (!schemeName || isNaN(latestNav) || latestNav <= 0) {
+						await setUserState(env.DB, chatId, "IDLE");
 						await sendMessage(
 							env.BOT_TOKEN,
 							chatId,
@@ -336,7 +344,7 @@ export default {
 							userState.temp_base_nav != null &&
 							Number.isFinite(Number(userState.temp_base_nav))
 								? `Base NAV is already set to ₹${Number(userState.temp_base_nav).toFixed(2)}. Please enter your target gain percentage (e.g., enter <code>10</code> for 10%):`
-								: "This prompt has expired. Please use /add to start tracking a fund.";
+								: ADD_PROMPT_EXPIRED_TEXT;
 						await sendOrEditMessage(
 							env.BOT_TOKEN,
 							chatId,
@@ -373,7 +381,7 @@ export default {
 				if (action === "DELETE_PAGE" && arg && /^\d+$/.test(arg)) {
 					const userState = await getUserState(env.DB, chatId);
 					if (!userState || userState.state !== "AWAITING_DELETE") {
-						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						await sendExpiredPrompt(env.BOT_TOKEN, chatId, DELETE_PROMPT_EXPIRED_TEXT, messageId);
 						return new Response("OK");
 					}
 
@@ -405,7 +413,7 @@ export default {
 						!userState ||
 						(userState.state !== "AWAITING_DELETE" && userState.state !== "DELETE_COMPLETED")
 					) {
-						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						await sendExpiredPrompt(env.BOT_TOKEN, chatId, DELETE_PROMPT_EXPIRED_TEXT, messageId);
 						return new Response("OK");
 					}
 
@@ -419,7 +427,7 @@ export default {
 						.first<TrackedFundRow>();
 
 					if (userState.state === "DELETE_COMPLETED" && target) {
-						await sendExpiredDeletePrompt(env.BOT_TOKEN, chatId, messageId);
+						await sendExpiredPrompt(env.BOT_TOKEN, chatId, DELETE_PROMPT_EXPIRED_TEXT, messageId);
 						return new Response("OK");
 					}
 
@@ -466,7 +474,7 @@ export default {
 				const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : null;
 
 				if (command && command !== "/delete" && command !== "/start" && command !== "/add") {
-					await clearPendingDeleteState(env.DB, chatId);
+					await clearPendingState(env.DB, chatId);
 				}
 
 				if (command === "/start") {
@@ -581,6 +589,7 @@ export default {
 						})),
 					];
 
+					await setUserState(env.DB, chatId, "AWAITING_FUND_SELECTION");
 					await sendMessage(
 						env.BOT_TOKEN,
 						chatId,
